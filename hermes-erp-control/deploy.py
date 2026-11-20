@@ -16,6 +16,7 @@ TARGET = Path('/opt/prabhat-workbench')
 DOCS = Path('/home/hermeslab/docs_mcp.py')
 CONFIG = Path('/home/hermes/.hermes/config.yaml')
 SOUL = Path('/home/hermes/.hermes/SOUL.md')
+STAFF_SOUL = Path('/home/hermes/.hermes/profiles/erp-staff/SOUL.md')
 TAG = 'PRABHAT_WORKBENCH_ADAPTER_V1'
 ROUTE_TAG = 'Prabhat ERP execution routing — workbench v1'
 
@@ -49,9 +50,9 @@ def main():
     backup = TARGET / 'backups' / stamp
     backup.mkdir(parents=True, exist_ok=False)
     manifest = {}
-    for path in [DOCS, CONFIG, SOUL, Path('/etc/systemd/system/prabhat-workbench.service')]:
+    for index, path in enumerate([DOCS, CONFIG, SOUL, STAFF_SOUL, Path('/etc/systemd/system/prabhat-workbench.service')]):
         if path.exists():
-            copy = backup / path.name
+            copy = backup / (str(index) + '-' + path.name)
             shutil.copy2(path, copy)
             manifest[str(path)] = str(copy)
     (backup/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
@@ -97,9 +98,10 @@ def main():
     CONFIG.write_text(yaml.safe_dump(config,sort_keys=False,allow_unicode=True))
     owner=pwd.getpwnam('hermes')
     os.chown(CONFIG,owner.pw_uid,owner.pw_gid)
-    if ROUTE_TAG not in SOUL.read_text():
-        with SOUL.open('a') as f:
-            f.write(GUIDANCE)
+    for instructions in [SOUL, STAFF_SOUL]:
+        if instructions.exists() and ROUTE_TAG not in instructions.read_text():
+            with instructions.open('a') as f:
+                f.write(GUIDANCE)
     shutil.copy2(TARGET/'prabhat-workbench.service','/etc/systemd/system/prabhat-workbench.service')
     os.chmod('/etc/systemd/system/prabhat-workbench.service',0o644)
     run(['systemctl','daemon-reload'])

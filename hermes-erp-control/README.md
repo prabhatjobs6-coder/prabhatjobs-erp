@@ -24,7 +24,7 @@ This worker runs fixed file operations only. It does not execute arbitrary comma
 
 ## Install on the existing VPS
 
-Run `sudo python3 deploy.py` from this directory. This creates an isolated virtual environment, installs the requirements, backs up the existing document MCP and relevant Hermes configuration, extends the document MCP, installs the worker service and adds routing guidance to the existing Hermes instruction file. Existing MCP credentials and ERP approvals are preserved.
+Run `sudo python3 deploy.py` from this directory. This creates an isolated virtual environment, installs the requirements, backs up the existing document MCP and relevant Hermes configuration, extends the document MCP, installs the worker service and adds routing guidance to the existing default and ERP staff instruction files. Existing MCP credentials and ERP approvals are preserved.
 
 After testing the new document MCP, reload MCP tools in Hermes or restart the existing gateway during an idle period. A new chat may be needed to see refreshed tools.
 
