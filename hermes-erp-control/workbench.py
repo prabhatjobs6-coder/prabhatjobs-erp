@@ -363,16 +363,21 @@ def heartbeat():
     STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = STATE / "heartbeat.json"
     temporary = STATE / "heartbeat.tmp"
-    temporary.write_text(json.dumps({"at": time.time(), "pid": os.getpid()}))
+    libraries = {m: bool(importlib.util.find_spec(m)) for m in ("pypdf", "openpyxl", "reportlab", "docx")}
+    temporary.write_text(json.dumps({"at": time.time(), "pid": os.getpid(), "libraries": libraries}))
     temporary.replace(path)
 
 
 def capabilities():
     beat = STATE / "heartbeat.json"
     age = max(0, time.time() - beat.stat().st_mtime) if beat.exists() else None
+    try:
+        info = json.loads(beat.read_text())
+    except (OSError, ValueError):
+        info = {}
     return {"operations": sorted(OPERATIONS), "max_input_bytes": MAX_BYTES,
             "worker_online": age is not None and age < 15, "worker_heartbeat_age_seconds": age,
-            "libraries": {m: bool(importlib.util.find_spec(m)) for m in ("pypdf", "openpyxl", "reportlab", "docx")},
+            "libraries": info.get("libraries", {m: bool(importlib.util.find_spec(m)) for m in ("pypdf", "openpyxl", "reportlab", "docx")}),
             "scope": "Local file/media processing only. ERP actions use PrabhatJobs MCP under the requesting user's permissions.",
             "delivery": "Return the verified MEDIA path or upload through the authenticated ERP tool. No public sharing is created."}
 
