@@ -5,6 +5,8 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import hashlib
+import hmac
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import json
 import math
@@ -15,7 +17,9 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
+from urllib.parse import parse_qs, urlencode, urlsplit
 import uuid
 from xml.sax.saxutils import escape
 
@@ -24,6 +28,14 @@ STATE = Path(os.environ.get("PWF_STATE_ROOT", "/home/hermeslab/.local/state/prab
 MAX_BYTES = 64 * 1024 * 1024
 MAX_ATTEMPTS = 3
 LEASE_SECONDS = 30
+PUBLIC_BASE = os.environ.get("PWF_PUBLIC_BASE_URL", "https://hermes-api.prabhatjobs.tech").rstrip("/")
+DOWNLOAD_SECONDS = 900
+DOWNLOAD_SLOTS = threading.BoundedSemaphore(4)
+MIME_TYPES = {".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+              ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+              ".pdf": "application/pdf", ".mp4": "video/mp4", ".webm": "video/webm",
+              ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+              ".mp3": "audio/mpeg", ".wav": "audio/wav"}
 OPERATIONS = {"spreadsheet_create", "document_create", "pdf_split", "pdf_merge",
               "video_edit", "video_merge", "images_to_video", "video_thumbnail", "extract_audio"}
 MEDIA_OPERATIONS = {op for op in OPERATIONS if op.startswith("video_")} | {"images_to_video", "extract_audio"}
@@ -72,8 +84,12 @@ def artifact(path):
     path = checked_file(str(path))
     if path.stat().st_size == 0:
         raise ValueError("Output file is empty")
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
     return {"path": str(path), "bytes": path.stat().st_size,
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "sha256": digest.hexdigest(),
             "send_with": "MEDIA:" + str(path)}
 
 
@@ -277,14 +293,114 @@ def checked_id(job_id):
     return job_id
 
 
+def signing_key():
+    STATE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    path = STATE / "download.key"
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        pass
+    else:
+        with os.fdopen(fd, "wb") as file:
+            file.write(os.urandom(32))
+    key = path.read_bytes()
+    if len(key) != 32:
+        raise ValueError("Download signing key is invalid")
+    return key
+
+
+def download_url(job_id, index, item, expires=None):
+    expires = int(time.time()) + DOWNLOAD_SECONDS if expires is None else expires
+    payload = f"{job_id}:{index}:{expires}:{item['sha256']}".encode()
+    signature = hmac.new(signing_key(), payload, hashlib.sha256).hexdigest()
+    return PUBLIC_BASE + f"/workbench/files/{job_id}/{index}?" + urlencode({"expires": expires, "signature": signature})
+
+
+def validated_download(job_id, index, expires, signature):
+    if int(expires) < int(time.time()) or int(expires) > int(time.time()) + DOWNLOAD_SECONDS + 60:
+        raise ValueError("Invalid download")
+    with db() as con:
+        row = con.execute("SELECT result FROM jobs WHERE id=? AND state='done'", (checked_id(job_id),)).fetchone()
+    if row is None:
+        raise ValueError("Invalid download")
+    items = json.loads(row["result"]).get("artifacts", [])
+    item = items[index]
+    payload = f"{job_id}:{index}:{int(expires)}:{item['sha256']}".encode()
+    expected = hmac.new(signing_key(), payload, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise ValueError("Invalid download")
+    p = checked_file(item["path"])
+    if not p.is_relative_to((ROOT / "out").resolve()) or p.suffix.lower() not in MIME_TYPES:
+        raise ValueError("Invalid download")
+    current = artifact(p)
+    if current["sha256"] != item["sha256"]:
+        raise ValueError("Artifact changed since completion")
+    return p
+
+
+class DownloadHandler(BaseHTTPRequestHandler):
+    server_version = "PrabhatFiles"
+
+    def log_message(self, *_):
+        # Signed URLs must never be copied into access logs.
+        pass
+
+    def do_HEAD(self):
+        self.do_GET(head_only=True)
+
+    def do_GET(self, head_only=False):
+        if not DOWNLOAD_SLOTS.acquire(blocking=False):
+            self.send_error(503)
+            return
+        try:
+            try:
+                parsed = urlsplit(self.path)
+                match = re.fullmatch(r"/workbench/files/([0-9a-f]{32})/([0-9]{1,2})", parsed.path)
+                query = parse_qs(parsed.query, strict_parsing=True)
+                if match is None or set(query) != {"expires", "signature"} or any(len(v) != 1 for v in query.values()):
+                    raise ValueError("Invalid download")
+                signature = query["signature"][0]
+                if not re.fullmatch("[0-9a-f]{64}", signature):
+                    raise ValueError("Invalid download")
+                p = validated_download(match[1], int(match[2]), int(query["expires"][0]), signature)
+                file = p.open("rb")
+            except (ValueError, KeyError, IndexError, OSError):
+                self.send_error(404)
+                return
+            with file:
+                self.send_response(200)
+                self.send_header("Content-Type", MIME_TYPES[p.suffix.lower()])
+                self.send_header("Content-Length", str(os.fstat(file.fileno()).st_size))
+                self.send_header("Content-Disposition", 'attachment; filename="' + p.name + '"')
+                self.send_header("Cache-Control", "private, no-store")
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                if not head_only:
+                    for chunk in iter(lambda: file.read(1024 * 1024), b""):
+                        self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            DOWNLOAD_SLOTS.release()
+
+
 def status(job_id):
     with db() as con:
         row = con.execute("SELECT * FROM jobs WHERE id=?", (checked_id(job_id),)).fetchone()
     if not row:
         raise ValueError("Job not found")
+    result = json.loads(row["result"]) if row["result"] else None
+    if row["state"] == "done" and result:
+        for index, item in enumerate(result.get("artifacts", [])):
+            item["download_url"] = download_url(job_id, index, item)
+            item["download_expires_in_seconds"] = DOWNLOAD_SECONDS
+        if len(result.get("artifacts", [])) == 1:
+            result["download_url"] = result["artifacts"][0]["download_url"]
+            result["link_valid"] = "15 minutes"
     return {"job_id": row["id"], "operation": row["operation"], "state": row["state"],
             "attempts": row["attempts"], "created_at": row["created"], "updated_at": row["updated"],
-            "result": json.loads(row["result"]) if row["result"] else None, "error": row["error"],
+            "result": result, "error": row["error"],
             "next": "Poll workbench_status with this job_id" if row["state"] in {"queued", "running"} else None}
 
 
@@ -379,7 +495,7 @@ def capabilities():
             "worker_online": age is not None and age < 15, "worker_heartbeat_age_seconds": age,
             "libraries": info.get("libraries", {m: bool(importlib.util.find_spec(m)) for m in ("pypdf", "openpyxl", "reportlab", "docx")}),
             "scope": "Local file/media processing only. ERP actions use PrabhatJobs MCP under the requesting user's permissions.",
-            "delivery": "Return the verified MEDIA path or upload through the authenticated ERP tool. No public sharing is created."}
+            "delivery": "Use exactly the private signed download_url from a completed job, valid 15 minutes. Poll status to refresh it. Never construct a URL from a local path. ERP uploads still use authenticated ERP tools."}
 
 
 def schema(properties, required=()):
@@ -390,7 +506,7 @@ TOOLS = [
     {"name": "workbench_capabilities", "description": "List supported file jobs and installed libraries; read-only.", "inputSchema": schema({})},
     {"name": "workbench_submit", "description": "Queue durable file work: spreadsheet_create(columns,rows,sheet_name,title); document_create(title,subtitle,sections:[{heading,lines}],format:pdf|docx); pdf_split(path,groups:[{name,pages:[1,2]}]); pdf_merge(paths); or existing video_edit/video_merge/images_to_video/video_thumbnail/extract_audio arguments. No arbitrary commands. Preserve supplied facts. Returns a job id, not completion. Poll status and deliver verified artifacts. This never sends messages or changes ERP data.",
      "inputSchema": schema({"operation": {"type": "string", "enum": sorted(OPERATIONS)}, "arguments": {"type": "object"}, "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 200}}, ("operation", "arguments"))},
-    {"name": "workbench_status", "description": "Read one job's queued/running/done/failed/cancelled state. Only done plus verified artifacts means completion. Keep the opaque job id private.", "inputSchema": schema({"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, ("job_id",))},
+    {"name": "workbench_status", "description": "Read one job's state and completed artifacts. Return exactly the provided signed download_url as a Markdown link; it expires in 15 minutes and another status call refreshes it. Never build a URL from the local path. Keep job ids and signed URLs private.", "inputSchema": schema({"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, ("job_id",))},
     {"name": "workbench_cancel", "description": "Cancel one queued/running local file job using its opaque id. Does not delete files or ERP records.", "inputSchema": schema({"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, ("job_id",))},
     {"name": "workbench_verify_file", "description": "Verify a workspace file exists, is nonempty and return its SHA256 and MEDIA delivery path; read-only.", "inputSchema": schema({"path": {"type": "string"}}, ("path",))},
 ]
@@ -421,9 +537,13 @@ def main():
     os.umask(0o077)
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--serve", action="store_true")
     parser.add_argument("--execute-job")
     args = parser.parse_args()
-    if args.execute_job:
+    if args.serve:
+        signing_key()
+        ThreadingHTTPServer(("127.0.0.1", 8766), DownloadHandler).serve_forever()
+    elif args.execute_job:
         execute_job(args.execute_job)
     elif args.worker:
         while True:

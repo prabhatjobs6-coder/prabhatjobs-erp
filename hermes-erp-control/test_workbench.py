@@ -7,7 +7,11 @@ import subprocess
 import sys
 import tempfile
 import time
+import threading
 import unittest
+import urllib.request
+import urllib.error
+from urllib.parse import urlsplit
 
 
 class WorkbenchTests(unittest.TestCase):
@@ -107,6 +111,41 @@ class WorkbenchTests(unittest.TestCase):
             self.w.document_create('a'*32,'Candidate',sections)
         result = self.w.document_create('b'*32,'Candidate',sections,format='docx')
         self.assertIn('ગુજરાતી નામ',[p.text for p in Document(result['artifacts'][0]['path']).paragraphs])
+
+    def test_signed_download_requires_valid_unexpired_artifact_signature(self):
+        job = self.w.submit('spreadsheet_create',{'columns':['Name'],'rows':[['Synthetic']]})
+        self.w.run_one()
+        result = self.w.status(job['job_id'])
+        item = result['result']['artifacts'][0]
+        server = self.w.ThreadingHTTPServer(('127.0.0.1',0),self.w.DownloadHandler)
+        thread = threading.Thread(target=server.serve_forever,daemon=True)
+        thread.start()
+        def local(url):
+            parts=urlsplit(url)
+            return f'http://127.0.0.1:{server.server_port}'+parts.path+'?'+parts.query
+        def rejected(url):
+            with self.assertRaises(urllib.error.HTTPError) as exc:
+                urllib.request.urlopen(url)
+            self.assertEqual(exc.exception.code,404)
+        try:
+            url = local(item['download_url'])
+            with urllib.request.urlopen(url) as response:
+                self.assertEqual(response.status,200)
+                self.assertTrue(response.read().startswith(b'PK'))
+                self.assertIn('attachment;',response.headers['Content-Disposition'])
+                self.assertEqual(response.headers['Cache-Control'],'private, no-store')
+            with urllib.request.urlopen(urllib.request.Request(url,method='HEAD')) as response:
+                self.assertEqual(response.read(),b'')
+            rejected(url.rsplit('=',1)[0]+'='+'0'*64)
+            expired=self.w.download_url(job['job_id'],0,item,expires=int(time.time())-1)
+            rejected(local(expired))
+            rejected(f'http://127.0.0.1:{server.server_port}/workbench/files/{job["job_id"]}/0')
+            Path(item['path']).write_bytes(b'changed after completion')
+            rejected(url)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == '__main__':

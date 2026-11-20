@@ -19,6 +19,15 @@ SOUL = Path('/home/hermes/.hermes/SOUL.md')
 STAFF_SOUL = Path('/home/hermes/.hermes/profiles/erp-staff/SOUL.md')
 TAG = 'PRABHAT_WORKBENCH_ADAPTER_V1'
 ROUTE_TAG = 'Prabhat ERP execution routing — workbench v1'
+DELIVERY_TAG = 'Workbench private file delivery v1'
+SERVICES = ['prabhat-workbench.service', 'prabhat-workbench-files.service', 'prabhat-workbench-bridge.service']
+CADDY = Path('/opt/prabhat-ai/Caddyfile')
+DELIVERY_GUIDANCE = '''
+
+### Workbench private file delivery v1
+
+For a completed workbench job, return exactly result.artifacts[].download_url as a Markdown download link. These private signed links expire after 15 minutes; another workbench_status call refreshes them. Never invent a URL by joining /media/ with a local path, and never claim a 3-day lifetime for a workbench link. If the tool has not returned download_url, say file delivery is pending. The file URL and job id are private capabilities; do not publish or message them to anyone else without that explicit request.
+'''
 
 GUIDANCE = '''
 
@@ -50,14 +59,15 @@ def main():
     backup = TARGET / 'backups' / stamp
     backup.mkdir(parents=True, exist_ok=False)
     manifest = {}
-    for index, path in enumerate([DOCS, CONFIG, SOUL, STAFF_SOUL, Path('/etc/systemd/system/prabhat-workbench.service')]):
+    targets = [DOCS, CONFIG, SOUL, STAFF_SOUL, CADDY] + [Path('/etc/systemd/system')/name for name in SERVICES]
+    for index, path in enumerate(targets):
         if path.exists():
             copy = backup / (str(index) + '-' + path.name)
             shutil.copy2(path, copy)
             manifest[str(path)] = str(copy)
     (backup/'manifest.json').write_text(json.dumps(manifest,indent=2)+'\n')
     os.chmod(TARGET, 0o755)
-    for name in ['workbench.py','test_workbench.py','requirements.txt','README.md','prabhat-workbench.service','deploy.py']:
+    for name in ['workbench.py','test_workbench.py','requirements.txt','README.md','deploy.py'] + SERVICES:
         if SOURCE / name != TARGET / name:
             shutil.copy2(SOURCE/name,TARGET/name)
         os.chmod(TARGET/name,0o644)
@@ -102,10 +112,28 @@ def main():
         if instructions.exists() and ROUTE_TAG not in instructions.read_text():
             with instructions.open('a') as f:
                 f.write(GUIDANCE)
-    shutil.copy2(TARGET/'prabhat-workbench.service','/etc/systemd/system/prabhat-workbench.service')
-    os.chmod('/etc/systemd/system/prabhat-workbench.service',0o644)
+        if instructions.exists() and DELIVERY_TAG not in instructions.read_text():
+            with instructions.open('a') as f:
+                f.write(DELIVERY_GUIDANCE)
+    for name in SERVICES:
+        destination = Path('/etc/systemd/system')/name
+        shutil.copy2(TARGET/name,destination)
+        destination.chmod(0o644)
     run(['systemctl','daemon-reload'])
-    run(['systemctl','enable','--now','prabhat-workbench.service'])
+    run(['systemctl','enable','--now']+SERVICES)
+    if CADDY.exists() and 'PRABHAT_WORKBENCH_DOWNLOADS_V1' not in CADDY.read_text():
+        original = CADDY.read_text()
+        marker = 'hermes-api.prabhatjobs.tech {'
+        if original.count(marker) != 1:
+            raise SystemExit('Caddy hostname shape changed; review the file-download route before modifying')
+        route = '''\n    # PRABHAT_WORKBENCH_DOWNLOADS_V1 — each request requires a valid expiring artifact signature\n    handle /workbench/files/* {\n        reverse_proxy unix//run/hermes-caddy/workbench.sock\n    }\n'''
+        CADDY.write_text(original.replace(marker,marker+route))
+        try:
+            run(['docker','exec','prabhat-ai-caddy-1','caddy','validate','--config','/etc/caddy/Caddyfile'])
+            run(['docker','exec','prabhat-ai-caddy-1','caddy','reload','--config','/etc/caddy/Caddyfile'])
+        except Exception:
+            CADDY.write_text(original)
+            raise
     print('INSTALLED',json.dumps({'backup':str(backup),'worker':'prabhat-workbench.service','reload_hermes_required':True}))
 
 
