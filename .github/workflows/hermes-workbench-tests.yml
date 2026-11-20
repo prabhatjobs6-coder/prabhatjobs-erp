@@ -1,0 +1,32 @@
+name: Hermes workbench regression tests
+
+on:
+  push:
+    paths:
+      - 'hermes-erp-control/**'
+      - '.github/workflows/hermes-workbench-tests.yml'
+  pull_request:
+    paths:
+      - 'hermes-erp-control/**'
+      - '.github/workflows/hermes-workbench-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-workbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install workbench test dependencies
+        run: python -m pip install -r hermes-erp-control/requirements.txt
+      - name: Run workbench regression tests
+        working-directory: hermes-erp-control
+        run: python -m unittest -v test_workbench.py

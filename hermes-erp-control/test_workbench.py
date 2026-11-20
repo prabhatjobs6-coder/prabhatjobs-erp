@@ -90,6 +90,38 @@ class WorkbenchTests(unittest.TestCase):
         self.assertEqual(self.w.claim(),b['job_id'])
         self.assertEqual(self.w.status(b['job_id'])['attempts'],2)
 
+    def test_health_reports_queue_and_never_exposes_candidate_data(self):
+        candidate_label = 'Confidential Test Candidate'
+        self.w.submit('spreadsheet_create',
+                      {'columns': ['Candidate'], 'rows': [[candidate_label]]})
+        self.w.heartbeat()
+        health = self.w.workbench_health()
+        self.assertTrue(health['read_only'])
+        self.assertTrue(health['worker_online'])
+        self.assertEqual(health['status'], 'ok')
+        self.assertEqual(health['ready_jobs'], 1)
+        self.assertEqual(health['job_states']['queued'], 1)
+        self.assertNotIn(candidate_label, json.dumps(health))
+
+    def test_health_detects_stalled_lease_and_retry_backlog(self):
+        job = self.w.submit('spreadsheet_create',
+                            {'columns': ['Candidate'], 'rows': [['Synthetic']]})
+        self.assertEqual(self.w.claim(), job['job_id'])
+        with self.w.db() as con:
+            con.execute("UPDATE jobs SET lease_until=? WHERE id=?",
+                        (time.time() - 30, job['job_id']))
+        health = self.w.workbench_health()
+        self.assertEqual(health['stale_running_leases'], 1)
+        self.assertIn('expired_running_job_leases', health['alerts'])
+        self.assertEqual(health['status'], 'needs_attention')
+        self.assertEqual(self.w.claim(), job['job_id'])
+        health = self.w.workbench_health()
+        self.assertEqual(health['retry_pending'], 0)
+        self.w.finish(job['job_id'], error='Synthetic failure', retry=True)
+        health = self.w.workbench_health()
+        self.assertEqual(health['retry_pending'], 1)
+        self.assertEqual(health['stale_running_leases'], 0)
+
     def test_protocol_and_unsupported_command(self):
         inp = '\n'.join(json.dumps(m) for m in [
             {'jsonrpc':'2.0','id':1,'method':'initialize','params':{'protocolVersion':'2025-03-26'}},
@@ -101,7 +133,7 @@ class WorkbenchTests(unittest.TestCase):
         messages = [json.loads(l) for l in r.stdout.splitlines()]
         self.assertEqual(len(messages),3)
         self.assertEqual(messages[0]['result']['protocolVersion'],'2025-03-26')
-        self.assertEqual(len(messages[1]['result']['tools']),5)
+        self.assertEqual(len(messages[1]['result']['tools']),6)
         self.assertTrue(messages[2]['result']['isError'])
 
     def test_indic_pdf_refuses_unshaped_text_and_docx_preserves_unicode(self):

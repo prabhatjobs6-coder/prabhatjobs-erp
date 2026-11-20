@@ -484,6 +484,56 @@ def heartbeat():
     temporary.replace(path)
 
 
+def workbench_health():
+    """Read-only job/worker telemetry. Never returns arguments, paths or candidate data."""
+    now = time.time()
+    with db() as con:
+        states = {row["state"]: row["count"] for row in
+                  con.execute("SELECT state, COUNT(*) AS count FROM jobs GROUP BY state")}
+        ready = con.execute(
+            "SELECT COUNT(*) AS count, MIN(created) AS oldest FROM jobs "
+            "WHERE state='queued' AND cancelled=0 AND retry_at<=?", (now,)
+        ).fetchone()
+        retry_pending = con.execute(
+            "SELECT COUNT(*) AS count FROM jobs "
+            "WHERE state='queued' AND cancelled=0 AND attempts>0"
+        ).fetchone()["count"]
+        stale_running = con.execute(
+            "SELECT COUNT(*) AS count FROM jobs "
+            "WHERE state='running' AND lease_until<?", (now,)
+        ).fetchone()["count"]
+        failed_24h = con.execute(
+            "SELECT COUNT(*) AS count FROM jobs "
+            "WHERE state='failed' AND updated>=?", (now - 86400,)
+        ).fetchone()["count"]
+    try:
+        heartbeat_age = max(0.0, now - (STATE / "heartbeat.json").stat().st_mtime)
+    except OSError:
+        heartbeat_age = None
+    worker_online = heartbeat_age is not None and heartbeat_age < 15
+    oldest_ready_age = max(0.0, now - ready["oldest"]) if ready["oldest"] is not None else None
+    alerts = []
+    if not worker_online:
+        alerts.append("worker_heartbeat_missing_or_stale")
+    if stale_running:
+        alerts.append("expired_running_job_leases")
+    if oldest_ready_age is not None and oldest_ready_age > 300:
+        alerts.append("ready_jobs_waiting_over_5_minutes")
+    return {
+        "status": "needs_attention" if alerts else "ok",
+        "worker_online": worker_online,
+        "heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+        "job_states": states,
+        "ready_jobs": ready["count"],
+        "oldest_ready_age_seconds": round(oldest_ready_age, 1) if oldest_ready_age is not None else None,
+        "retry_pending": retry_pending,
+        "stale_running_leases": stale_running,
+        "failed_last_24h": failed_24h,
+        "alerts": alerts,
+        "read_only": True,
+    }
+
+
 def capabilities():
     beat = STATE / "heartbeat.json"
     age = max(0, time.time() - beat.stat().st_mtime) if beat.exists() else None
@@ -504,13 +554,14 @@ def schema(properties, required=()):
 
 TOOLS = [
     {"name": "workbench_capabilities", "description": "List supported file jobs and installed libraries; read-only.", "inputSchema": schema({})},
+    {"name": "workbench_health", "description": "Read-only reliability diagnostic: worker heartbeat, job queue totals, stalled leases, retry backlog and recent failures. Does not expose candidate data, job IDs, local paths or file contents.", "inputSchema": schema({})},
     {"name": "workbench_submit", "description": "Queue durable file work: spreadsheet_create(columns,rows,sheet_name,title); document_create(title,subtitle,sections:[{heading,lines}],format:pdf|docx); pdf_split(path,groups:[{name,pages:[1,2]}]); pdf_merge(paths); or existing video_edit/video_merge/images_to_video/video_thumbnail/extract_audio arguments. No arbitrary commands. Preserve supplied facts. Returns a job id, not completion. Poll status and deliver verified artifacts. This never sends messages or changes ERP data.",
      "inputSchema": schema({"operation": {"type": "string", "enum": sorted(OPERATIONS)}, "arguments": {"type": "object"}, "idempotency_key": {"type": "string", "minLength": 8, "maxLength": 200}}, ("operation", "arguments"))},
     {"name": "workbench_status", "description": "Read one job's state and completed artifacts. Return exactly the provided signed download_url as a Markdown link; it expires in 15 minutes and another status call refreshes it. Never build a URL from the local path. Keep job ids and signed URLs private.", "inputSchema": schema({"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, ("job_id",))},
     {"name": "workbench_cancel", "description": "Cancel one queued/running local file job using its opaque id. Does not delete files or ERP records.", "inputSchema": schema({"job_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"}}, ("job_id",))},
     {"name": "workbench_verify_file", "description": "Verify a workspace file exists, is nonempty and return its SHA256 and MEDIA delivery path; read-only.", "inputSchema": schema({"path": {"type": "string"}}, ("path",))},
 ]
-FUNCTIONS = {"workbench_capabilities": capabilities, "workbench_submit": submit,
+FUNCTIONS = {"workbench_capabilities": capabilities, "workbench_health": workbench_health, "workbench_submit": submit,
              "workbench_status": status, "workbench_cancel": cancel, "workbench_verify_file": artifact}
 
 

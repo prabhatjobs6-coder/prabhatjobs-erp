@@ -22,6 +22,18 @@ Operations: `spreadsheet_create`, `document_create`, `pdf_split`, `pdf_merge`, p
 
 This worker runs fixed file operations only. It does not execute arbitrary commands, send messages, update ERP records, grant permissions or store ERP credentials. A completed job returns a private signed download URL valid for 15 minutes. Only an artifact recorded for that completed job can be downloaded; missing, expired, modified or invalid signatures are rejected. A status call refreshes the URL. ERP uploads continue through the approved ERP tools.
 
+## Reliability guardian — read-only diagnosis
+
+The MCP now also exposes workbench_health. It returns aggregate job states, jobs ready to run, retry backlog, failed jobs in the last 24 hours, expired running-job leases, worker heartbeat age and machine-readable alerts. It deliberately excludes candidate names, job arguments, document paths, signed URLs and job IDs.
+
+Use this when Hermes reports a stuck document, spreadsheet or media job. A stale worker heartbeat, expired lease, or a ready job waiting over five minutes raises needs_attention. This is a **diagnostic**, not a self-healing mechanism: it makes no state changes and never restarts services, replays jobs, sends messages, or edits ERP records. Keep repair decisions subject to normal admin permissions and a tested rollback.
+
+After deploying the updated files using the documented backed-up installer, refresh/reload MCP tools to make workbench_health discoverable. Validate with:
+
+    python -m unittest -v test_workbench.py
+
+The local tests do not substitute for validating the active Hermes gateway and VPS worker.
+
 ## Install on the existing VPS
 
 Run `sudo python3 deploy.py` from this directory. This creates an isolated virtual environment, installs the requirements, backs up the existing document MCP and relevant Hermes/Caddy configuration, extends the document MCP, installs the worker and signed-file services, and adds routing guidance to the existing default and ERP staff instruction files. A narrowly scoped Caddy route forwards only `/workbench/files/*` to the signature-validating service. Existing MCP credentials and ERP approvals are preserved.
