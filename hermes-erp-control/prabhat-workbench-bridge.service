@@ -1,0 +1,17 @@
+[Unit]
+Description=Private socket for Prabhat file downloads
+After=prabhat-workbench-files.service hermes-caddy-bridge.service
+Requires=prabhat-workbench-files.service
+
+[Service]
+ExecStart=/usr/bin/socat UNIX-LISTEN:/run/hermes-caddy/workbench.sock,fork,mode=0600,unlink-early TCP:127.0.0.1:8766
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/hermes-caddy
+
+[Install]
+WantedBy=multi-user.target

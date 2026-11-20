@@ -1,0 +1,22 @@
+[Unit]
+Description=Prabhat signed file downloads
+After=network.target
+
+[Service]
+User=hermeslab
+Group=hermeslab
+WorkingDirectory=/opt/prabhat-workbench
+ExecStart=/opt/prabhat-workbench/venv/bin/python /opt/prabhat-workbench/workbench.py --serve
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermeslab/.local/state/prabhat-workbench
+MemoryMax=256M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+[Unit]
+Description=Prabhat Hermes durable file and media worker
+After=network.target
+
+[Service]
+Type=simple
+User=hermeslab
+Group=hermeslab
+WorkingDirectory=/opt/prabhat-workbench
+ExecStart=/opt/prabhat-workbench/venv/bin/python /opt/prabhat-workbench/workbench.py --worker
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=10
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermeslab/files /home/hermeslab/.local/state/prabhat-workbench
+MemoryMax=768M
+CPUQuota=100%
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target
